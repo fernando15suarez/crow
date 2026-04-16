@@ -53,7 +53,7 @@ async function gtMailSend(target, subject, body) {
 }
 
 async function gtMailInbox() {
-  const { stdout } = await execFileAsync("gt", ["mail", "inbox", "--json"], {
+  const { stdout } = await execFileAsync("gt", ["mail", "inbox", "crow", "--json"], {
     timeout: 30000,
   });
   try {
@@ -68,7 +68,10 @@ async function gtMailRead(id) {
   const { stdout } = await execFileAsync("gt", ["mail", "read", id], {
     timeout: 30000,
   });
-  return stdout.trim();
+  // Strip mail headers — body starts after the first blank line
+  const parts = stdout.split(/\n\n/);
+  const body = parts.length > 1 ? parts.slice(1).join("\n\n").trim() : stdout.trim();
+  return body;
 }
 
 // --- Inbound: Telegram -> gt mail ---
@@ -134,7 +137,7 @@ async function pollInbox() {
 
 async function pollInboxText() {
   try {
-    const { stdout } = await execFileAsync("gt", ["mail", "inbox"], {
+    const { stdout } = await execFileAsync("gt", ["mail", "inbox", "crow"], {
       timeout: 30000,
     });
 
@@ -224,7 +227,7 @@ async function seedSeenMails() {
       }
     } else {
       // Text fallback
-      const { stdout } = await execFileAsync("gt", ["mail", "inbox"], { timeout: 30000 });
+      const { stdout } = await execFileAsync("gt", ["mail", "inbox", "crow"], { timeout: 30000 });
       const ids = stdout.match(/\b([a-z]{2,}-[a-z0-9]+)\b/g) || [];
       for (const id of ids) seenMailIds.add(id);
     }
