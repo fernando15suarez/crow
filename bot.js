@@ -89,6 +89,15 @@ bot.on("message:text", async (ctx) => {
 
   try {
     await gtMailSend("mayor/", subject, text);
+    // Nudge the Mayor so they see it immediately (no polling delay)
+    try {
+      await execFileAsync("gt", [
+        "nudge", "mayor",
+        `[Telegram from ${from}]: ${text}\n\nReply via: gt mail send crow -s "reply" -m "your message"`,
+      ], { timeout: 10000 });
+    } catch (nudgeErr) {
+      console.error("Nudge failed (non-fatal):", nudgeErr.message);
+    }
     console.log(`Forwarded to mayor: "${subject}"`);
   } catch (err) {
     console.error("Failed to forward message to mayor:", err.message);
