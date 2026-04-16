@@ -375,7 +375,7 @@ async function transcribeAudio(audioPath) {
   // Run whisper CLI, output as plain text to stdout
   const { stdout } = await execFileAsync("whisper", [
     audioPath,
-    "--model", "base",
+    "--model", "small",
     "--output_format", "txt",
     "--output_dir", os.tmpdir(),
   ], { timeout: 120000 });
