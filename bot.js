@@ -5,6 +5,7 @@
 //
 // Inbound:  Telegram message -> gt nudge mayor + gt mail (durable record)
 // Outbound: HTTP API on CROW_PORT for instant delivery, mail poll as fallback
+// Events:   Watches .events.jsonl for lifecycle events (done, sling, spawn)
 //
 // Env vars:
 //   TELEGRAM_BOT_TOKEN  — required, from BotFather
@@ -16,6 +17,8 @@ const { Bot } = require("grammy");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 
 const execFileAsync = promisify(execFile);
 
@@ -23,6 +26,10 @@ const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const CROW_PORT = parseInt(process.env.CROW_PORT || "3333", 10);
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
+
+// --- Lifecycle event notifications ---
+const EVENTS_FILE = path.join(process.env.HOME || "/home/nando", "gt", ".events.jsonl");
+const NOTIFY_EVENT_TYPES = new Set(["done", "sling", "spawn"]);
 
 if (!TOKEN) {
   console.error("TELEGRAM_BOT_TOKEN is required");
@@ -259,6 +266,91 @@ const httpServer = http.createServer(async (req, res) => {
   }
 });
 
+// --- Lifecycle event watcher (.events.jsonl) ---
+
+function formatEventMessage(evt) {
+  const actor = evt.actor || "unknown";
+  const payload = evt.payload || {};
+
+  switch (evt.type) {
+    case "done": {
+      const bead = payload.bead || "?";
+      // Extract rig/project from actor like "mealpal/polecats/obsidian" -> "[mealpal]"
+      const rig = actor.split("/")[0];
+      return `[${rig}] Completed: ${bead} (${actor})`;
+    }
+    case "sling": {
+      const bead = payload.bead || "?";
+      const target = payload.target || "?";
+      return `Assigned ${bead} → ${target}`;
+    }
+    case "spawn": {
+      const target = payload.target || actor;
+      return `Spawned polecat: ${target}`;
+    }
+    default:
+      return null;
+  }
+}
+
+function watchEvents() {
+  let fileSize = 0;
+
+  // Start from end of file so we don't replay history
+  try {
+    const stat = fs.statSync(EVENTS_FILE);
+    fileSize = stat.size;
+  } catch {
+    console.log("Events file not found, will watch for creation");
+  }
+
+  const watcher = fs.watch(path.dirname(EVENTS_FILE), (eventType, filename) => {
+    if (filename !== path.basename(EVENTS_FILE)) return;
+    processNewEvents();
+  });
+
+  function processNewEvents() {
+    let stat;
+    try {
+      stat = fs.statSync(EVENTS_FILE);
+    } catch {
+      return;
+    }
+
+    if (stat.size <= fileSize) return;
+
+    const stream = fs.createReadStream(EVENTS_FILE, {
+      start: fileSize,
+      encoding: "utf8",
+    });
+
+    let buffer = "";
+    stream.on("data", (chunk) => { buffer += chunk; });
+    stream.on("end", () => {
+      fileSize = stat.size;
+      const lines = buffer.split("\n").filter((l) => l.trim());
+      for (const line of lines) {
+        try {
+          const evt = JSON.parse(line);
+          if (!NOTIFY_EVENT_TYPES.has(evt.type)) continue;
+          const msg = formatEventMessage(evt);
+          if (msg) {
+            bot.api.sendMessage(CHAT_ID, msg).then(
+              () => console.log(`Event notify: ${msg}`),
+              (err) => console.error("Event notify error:", err.message)
+            );
+          }
+        } catch {
+          // skip malformed lines
+        }
+      }
+    });
+  }
+
+  console.log("Watching events file for lifecycle notifications");
+  return watcher;
+}
+
 // --- Lifecycle ---
 
 async function seedSeenMails() {
@@ -300,6 +392,9 @@ async function start() {
   });
 
   pollTimer = setInterval(pollInbox, POLL_INTERVAL);
+
+  // Watch lifecycle events for Telegram notifications
+  watchEvents();
 }
 
 function shutdown(signal) {
