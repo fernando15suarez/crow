@@ -84,6 +84,45 @@ async function gtMailRead(id) {
   return body;
 }
 
+// --- Telegram commands: /handoff and /kill ---
+
+bot.command("handoff", async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  if (chatId !== CHAT_ID) return;
+
+  await ctx.reply("Requesting mayor handoff (soft)...");
+  try {
+    // Nudge the mayor to run the handoff skill
+    await execFileAsync("gt", [
+      "nudge", "mayor",
+      "[CROW COMMAND] Fernando requested /handoff via Telegram. Please run /handoff now to hand off to a fresh session.",
+      "--mode", "immediate",
+    ], { timeout: 15000 });
+    await ctx.reply("Nudged the mayor to handoff. They should wrap up and restart shortly.");
+  } catch (err) {
+    console.error("Handoff nudge failed:", err.message);
+    await ctx.reply("Nudge failed — mayor may be unresponsive. Use /kill for a hard restart.");
+  }
+});
+
+bot.command("kill", async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  if (chatId !== CHAT_ID) return;
+
+  await ctx.reply("Hard-killing mayor and spawning a fresh session...");
+  try {
+    const { stdout, stderr } = await execFileAsync("gt", [
+      "handoff", "mayor",
+    ], { timeout: 60000 });
+    const output = (stdout + "\n" + stderr).trim();
+    await ctx.reply(`Mayor restarted.\n${output.slice(0, 200)}`);
+    console.log("Hard handoff complete:", output);
+  } catch (err) {
+    console.error("Hard kill failed:", err.message);
+    await ctx.reply(`Hard kill failed: ${err.message.slice(0, 200)}`);
+  }
+});
+
 // --- Inbound: Telegram -> gt mail ---
 
 bot.on("message:text", async (ctx) => {
@@ -257,6 +296,32 @@ const httpServer = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: err.message }));
       }
     });
+  } else if (req.method === "POST" && req.url === "/handoff") {
+    // Soft handoff: nudge the mayor to run /handoff
+    try {
+      await execFileAsync("gt", [
+        "nudge", "mayor",
+        "[CROW COMMAND] Handoff requested via HTTP API. Please run /handoff now.",
+        "--mode", "immediate",
+      ], { timeout: 15000 });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, action: "handoff-nudge-sent" }));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+  } else if (req.method === "POST" && req.url === "/kill") {
+    // Hard kill: gt handoff mayor (kills and respawns)
+    try {
+      const { stdout, stderr } = await execFileAsync("gt", [
+        "handoff", "mayor",
+      ], { timeout: 60000 });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, output: (stdout + stderr).trim().slice(0, 500) }));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
   } else if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "ok", uptime: process.uptime() }));
