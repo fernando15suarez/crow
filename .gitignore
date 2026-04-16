@@ -6,3 +6,4 @@ state.json
 node_modules/
 .beads/
 .env
+permissions.json
