@@ -36,6 +36,9 @@ const bot = new Bot(TOKEN);
 // Track seen mail IDs to avoid re-sending
 const seenMailIds = new Set();
 
+// Subject prefix used for Telegram-originated messages
+const TELEGRAM_SUBJECT_PREFIX = "Telegram from ";
+
 // --- Helpers ---
 
 async function gtMailSend(target, subject, body) {
@@ -111,10 +114,15 @@ async function pollInbox() {
 
       if (msg.read) continue; // skip already-read messages
 
-      const body = await gtMailRead(id);
-      const sender = msg.from || msg.sender || "unknown";
       const subject = msg.subject || "(no subject)";
-      const text = `*${escapeMarkdown(sender)}*: ${escapeMarkdown(subject)}\n\n${escapeMarkdown(body)}`;
+
+      // Skip messages that originated from Telegram (prevents echo loop)
+      if (subject.startsWith(TELEGRAM_SUBJECT_PREFIX)) continue;
+
+      const rawBody = await gtMailRead(id);
+      const body = stripMailHeaders(rawBody);
+      const sender = formatSender(msg.from || msg.sender || "unknown");
+      const text = `${escapeMarkdown(sender)}: ${escapeMarkdown(subject)}\n\n${escapeMarkdown(body)}`;
 
       await bot.api.sendMessage(CHAT_ID, text, { parse_mode: "MarkdownV2" });
       console.log(`Sent to Telegram: [${id}] ${subject}`);
@@ -144,11 +152,19 @@ async function pollInboxText() {
 
       if (!line.includes("UNREAD") && !line.includes("unread")) continue;
 
-      const body = await gtMailRead(id);
       const subjectMatch = line.match(/Subject:\s*(.+)/i) || line.match(/\b[A-Z][A-Z]+:?\s+(.+)/);
       const subject = subjectMatch ? subjectMatch[1].trim() : "(mail)";
 
-      const text = `*Mail*: ${escapeMarkdown(subject)}\n\n${escapeMarkdown(body)}`;
+      // Skip messages that originated from Telegram (prevents echo loop)
+      if (subject.startsWith(TELEGRAM_SUBJECT_PREFIX)) continue;
+
+      const rawBody = await gtMailRead(id);
+      const body = stripMailHeaders(rawBody);
+
+      const fromMatch = line.match(/From:\s*(\S+)/i);
+      const sender = formatSender(fromMatch ? fromMatch[1] : "unknown");
+
+      const text = `${escapeMarkdown(sender)}: ${escapeMarkdown(subject)}\n\n${escapeMarkdown(body)}`;
 
       await bot.api.sendMessage(CHAT_ID, text, { parse_mode: "MarkdownV2" });
       console.log(`Sent to Telegram: [${id}] ${subject}`);
@@ -160,6 +176,39 @@ async function pollInboxText() {
 
 function escapeMarkdown(text) {
   return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
+}
+
+function stripMailHeaders(text) {
+  // gt mail read output often includes headers like From:, To:, Date:, ID:, Thread:, Subject:
+  // Strip those and return just the body
+  const lines = text.split("\n");
+  let bodyStart = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^(From|To|Date|ID|Thread|Subject|Bead|Status|Read):\s/i.test(lines[i])) {
+      bodyStart = i + 1;
+    } else if (lines[i].trim() === "" && bodyStart > 0) {
+      // Skip blank line after headers
+      bodyStart = i + 1;
+      break;
+    } else {
+      break;
+    }
+  }
+  return lines.slice(bodyStart).join("\n").trim();
+}
+
+function formatSender(sender) {
+  // Convert "mayor/" -> "Mayor", "crow/witness" -> "[crow/witness]",
+  // "mealpal/witness" -> "[mealpal/witness]"
+  if (!sender || sender === "unknown") return "Unknown";
+  // Strip trailing slash
+  const clean = sender.replace(/\/$/, "");
+  // Top-level roles get capitalized name
+  if (!clean.includes("/")) {
+    return clean.charAt(0).toUpperCase() + clean.slice(1);
+  }
+  // Sub-roles get bracketed
+  return `[${clean}]`;
 }
 
 // --- Lifecycle ---
