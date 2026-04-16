@@ -1,4 +1,4 @@
 {
   "8681623486": { "role": "admin", "rigs": ["*"] },
-  "6662429630": { "role": "user", "rigs": ["mealpal"] }
+  "-5102634893": { "role": "user", "rigs": ["mealpal", "streety"] }
 }
