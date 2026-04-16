@@ -734,6 +734,10 @@ function watchEvents() {
         try {
           const evt = JSON.parse(line);
           if (!NOTIFY_EVENT_TYPES.has(evt.type)) continue;
+          // Skip dog/deacon events — too noisy for Telegram
+          const actor = evt.actor || "";
+          const target = (evt.payload && evt.payload.target) || "";
+          if (actor.includes("dog") || actor.includes("deacon") || target.includes("dog") || target.includes("deacon")) continue;
           const msg = formatEventMessage(evt);
           if (msg) {
             bot.api.sendMessage(ADMIN_CHAT_ID, msg).then(
