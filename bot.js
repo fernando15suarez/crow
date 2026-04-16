@@ -9,7 +9,9 @@
 //
 // Env vars:
 //   TELEGRAM_BOT_TOKEN  — required, from BotFather
-//   TELEGRAM_CHAT_ID    — required, the chat to bridge messages to/from
+//   TELEGRAM_CHAT_IDS   — comma-separated list of authorized chat IDs
+//   TELEGRAM_CHAT_ID    — legacy single chat ID (fallback if TELEGRAM_CHAT_IDS not set)
+//   TELEGRAM_ADMIN_ID   — chat ID for admin-only commands (/handoff, /kill)
 //   CROW_PORT           — optional, HTTP API port (default: 3333)
 //   POLL_INTERVAL_MS    — optional, inbox poll interval (default: 30000)
 //   MAYOR_CHECK_INTERVAL_MS — optional, busy-mayor recheck interval (default: 15000)
@@ -24,9 +26,21 @@ const path = require("path");
 const execFileAsync = promisify(execFile);
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const CROW_PORT = parseInt(process.env.CROW_PORT || "3333", 10);
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
+
+// Multi-chat support: TELEGRAM_CHAT_IDS (comma-separated) takes precedence,
+// falls back to legacy TELEGRAM_CHAT_ID for backward compatibility.
+const AUTHORIZED_CHAT_IDS = new Set(
+  (process.env.TELEGRAM_CHAT_IDS || process.env.TELEGRAM_CHAT_ID || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
+
+// Admin-only commands (/handoff, /kill) restricted to this chat ID.
+// Falls back to TELEGRAM_CHAT_ID (the original single-user setup).
+const ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_ID || process.env.TELEGRAM_CHAT_ID || "";
 
 // --- Lifecycle event notifications ---
 const EVENTS_FILE = path.join(process.env.HOME || "/home/nando", "gt", ".events.jsonl");
@@ -37,8 +51,8 @@ if (!TOKEN) {
   process.exit(1);
 }
 
-if (!CHAT_ID) {
-  console.error("TELEGRAM_CHAT_ID is required");
+if (AUTHORIZED_CHAT_IDS.size === 0) {
+  console.error("TELEGRAM_CHAT_IDS or TELEGRAM_CHAT_ID is required");
   process.exit(1);
 }
 
@@ -94,7 +108,7 @@ async function gtMailRead(id) {
 
 bot.command("handoff", async (ctx) => {
   const chatId = String(ctx.chat.id);
-  if (chatId !== CHAT_ID) return;
+  if (chatId !== ADMIN_CHAT_ID) return;
 
   await ctx.reply("Requesting mayor handoff (soft)...");
   try {
@@ -113,7 +127,7 @@ bot.command("handoff", async (ctx) => {
 
 bot.command("kill", async (ctx) => {
   const chatId = String(ctx.chat.id);
-  if (chatId !== CHAT_ID) return;
+  if (chatId !== ADMIN_CHAT_ID) return;
 
   await ctx.reply("Hard-killing mayor and spawning a fresh session...");
   try {
@@ -145,6 +159,20 @@ async function checkMayorAvailable() {
   }
 }
 
+async function sendToAllChats(text, opts) {
+  const results = [];
+  for (const chatId of AUTHORIZED_CHAT_IDS) {
+    try {
+      await bot.api.sendMessage(chatId, text, opts);
+      results.push({ chatId, ok: true });
+    } catch (err) {
+      console.error(`Failed to send to chat ${chatId}:`, err.message);
+      results.push({ chatId, ok: false, error: err.message });
+    }
+  }
+  return results;
+}
+
 async function startMayorWatch() {
   if (mayorCheckTimer) return; // already watching
   mayorCheckTimer = setInterval(async () => {
@@ -154,7 +182,7 @@ async function startMayorWatch() {
       clearInterval(mayorCheckTimer);
       mayorCheckTimer = null;
       try {
-        await bot.api.sendMessage(CHAT_ID, "Mayor is back and available.");
+        await sendToAllChats("Mayor is back and available.");
         console.log("Mayor available again — notified Telegram");
       } catch (err) {
         console.error("Failed to send mayor-available notice:", err.message);
@@ -167,7 +195,7 @@ async function startMayorWatch() {
 
 bot.on("message:text", async (ctx) => {
   const chatId = String(ctx.chat.id);
-  if (chatId !== CHAT_ID) {
+  if (!AUTHORIZED_CHAT_IDS.has(chatId)) {
     console.log(`Ignoring message from unauthorized chat ${chatId}`);
     return;
   }
@@ -246,7 +274,7 @@ async function pollInbox() {
       const sender = formatSender(msg.from || msg.sender || "unknown");
       const text = `${escapeMarkdown(sender)}: ${escapeMarkdown(subject)}\n\n${escapeMarkdown(body)}`;
 
-      await bot.api.sendMessage(CHAT_ID, text, { parse_mode: "MarkdownV2" });
+      await sendToAllChats(text, { parse_mode: "MarkdownV2" });
       console.log(`Sent to Telegram: [${id}] ${subject}`);
     }
   } catch (err) {
@@ -288,7 +316,7 @@ async function pollInboxText() {
 
       const text = `${escapeMarkdown(sender)}: ${escapeMarkdown(subject)}\n\n${escapeMarkdown(body)}`;
 
-      await bot.api.sendMessage(CHAT_ID, text, { parse_mode: "MarkdownV2" });
+      await sendToAllChats(text, { parse_mode: "MarkdownV2" });
       console.log(`Sent to Telegram: [${id}] ${subject}`);
     }
   } catch (err) {
@@ -341,14 +369,20 @@ const httpServer = http.createServer(async (req, res) => {
     req.on("data", (chunk) => { body += chunk; });
     req.on("end", async () => {
       try {
-        const { message } = JSON.parse(body);
+        const { message, target } = JSON.parse(body);
         if (!message) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "message field required" }));
           return;
         }
-        await bot.api.sendMessage(CHAT_ID, message);
-        console.log(`HTTP /send: "${message.slice(0, 60)}..."`);
+        if (target) {
+          // Send to a specific chat ID
+          await bot.api.sendMessage(target, message);
+        } else {
+          // Send to all authorized chats
+          await sendToAllChats(message);
+        }
+        console.log(`HTTP /send: "${message.slice(0, 60)}..." (target: ${target || "all"})`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
@@ -461,7 +495,7 @@ function watchEvents() {
           if (!NOTIFY_EVENT_TYPES.has(evt.type)) continue;
           const msg = formatEventMessage(evt);
           if (msg) {
-            bot.api.sendMessage(CHAT_ID, msg).then(
+            sendToAllChats(msg).then(
               () => console.log(`Event notify: ${msg}`),
               (err) => console.error("Event notify error:", err.message)
             );
@@ -504,7 +538,8 @@ let pollTimer;
 
 async function start() {
   console.log("Crow Telegram Bot starting...");
-  console.log(`Chat ID: ${CHAT_ID}`);
+  console.log(`Authorized chat IDs: ${[...AUTHORIZED_CHAT_IDS].join(", ")}`);
+  console.log(`Admin chat ID: ${ADMIN_CHAT_ID}`);
   console.log(`Poll interval: ${POLL_INTERVAL}ms`);
 
   await seedSeenMails();
