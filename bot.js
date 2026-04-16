@@ -12,6 +12,7 @@
 //   TELEGRAM_CHAT_ID    — required, the chat to bridge messages to/from
 //   CROW_PORT           — optional, HTTP API port (default: 3333)
 //   POLL_INTERVAL_MS    — optional, inbox poll interval (default: 30000)
+//   MAYOR_CHECK_INTERVAL_MS — optional, busy-mayor recheck interval (default: 15000)
 
 const { Bot } = require("grammy");
 const { execFile } = require("child_process");
@@ -49,6 +50,11 @@ const seenMailIds = new Set();
 // Subject prefix used for Telegram-originated messages
 const TELEGRAM_SUBJECT_PREFIX = "Telegram from ";
 
+// --- Mayor busy-status tracking ---
+const MAYOR_CHECK_INTERVAL = parseInt(process.env.MAYOR_CHECK_INTERVAL_MS || "15000", 10);
+let mayorBusy = false;
+let mayorCheckTimer = null;
+
 // --- Helpers ---
 
 async function gtMailSend(target, subject, body) {
@@ -84,6 +90,40 @@ async function gtMailRead(id) {
   return body;
 }
 
+// --- Mayor busy detection and auto-reply ---
+
+async function checkMayorAvailable() {
+  try {
+    // Use wait-idle nudge with a short timeout to probe availability
+    // A silent probe — the mayor sees nothing if idle
+    await execFileAsync("gt", [
+      "nudge", "mayor", "--mode", "wait-idle",
+      "ping",
+    ], { timeout: 8000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function startMayorWatch() {
+  if (mayorCheckTimer) return; // already watching
+  mayorCheckTimer = setInterval(async () => {
+    const available = await checkMayorAvailable();
+    if (available && mayorBusy) {
+      mayorBusy = false;
+      clearInterval(mayorCheckTimer);
+      mayorCheckTimer = null;
+      try {
+        await bot.api.sendMessage(CHAT_ID, "Mayor is back and available.");
+        console.log("Mayor available again — notified Telegram");
+      } catch (err) {
+        console.error("Failed to send mayor-available notice:", err.message);
+      }
+    }
+  }, MAYOR_CHECK_INTERVAL);
+}
+
 // --- Inbound: Telegram -> gt mail ---
 
 bot.on("message:text", async (ctx) => {
@@ -100,15 +140,36 @@ bot.on("message:text", async (ctx) => {
   try {
     await gtMailSend("mayor/", subject, text);
     // Nudge the Mayor so they see it immediately (no polling delay)
+    let nudgeOk = false;
     try {
       await execFileAsync("gt", [
         "nudge", "mayor",
         `[Telegram from ${from}]: ${text}\n\nReply via: curl -s -X POST http://localhost:3333/send -H 'Content-Type: application/json' -d '{"message":"your reply"}'`,
       ], { timeout: 10000 });
+      nudgeOk = true;
     } catch (nudgeErr) {
       console.error("Nudge failed (non-fatal):", nudgeErr.message);
     }
-    console.log(`Forwarded to mayor: "${subject}"`);
+
+    // If nudge failed, mayor is likely busy — auto-reply and start watching
+    if (!nudgeOk && !mayorBusy) {
+      mayorBusy = true;
+      try {
+        await ctx.reply("Mayor is currently working and can't respond right now. Your message has been delivered — they'll see it shortly.");
+      } catch (replyErr) {
+        console.error("Failed to send busy auto-reply:", replyErr.message);
+      }
+      startMayorWatch();
+    } else if (!nudgeOk && mayorBusy) {
+      // Already notified about busy status, just acknowledge receipt
+      try {
+        await ctx.reply("Message delivered. Mayor is still busy — will notify you when they're available.");
+      } catch (replyErr) {
+        console.error("Failed to send busy follow-up:", replyErr.message);
+      }
+    }
+
+    console.log(`Forwarded to mayor: "${subject}" (nudge: ${nudgeOk ? "ok" : "failed/busy"})`);
   } catch (err) {
     console.error("Failed to forward message to mayor:", err.message);
     await ctx.reply("Failed to deliver message to Gas Town. Error logged.");
@@ -400,6 +461,7 @@ async function start() {
 function shutdown(signal) {
   console.log(`\nReceived ${signal}, shutting down...`);
   clearInterval(pollTimer);
+  if (mayorCheckTimer) clearInterval(mayorCheckTimer);
   bot.stop();
   process.exit(0);
 }
