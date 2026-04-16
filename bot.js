@@ -189,6 +189,53 @@ bot.command("kill", async (ctx) => {
   }
 });
 
+bot.command("sigint", async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  if (!isAdmin(chatId)) {
+    if (isAuthorized(chatId)) await ctx.reply("Only admin chats can use /sigint.");
+    return;
+  }
+
+  await ctx.reply("Sending SIGINT (Ctrl+C) to mayor's Claude Code process...");
+  try {
+    // Find the mayor's claude process via tmux session
+    const { stdout: paneCmd } = await execFileAsync("tmux", [
+      "list-panes", "-t", "mayor", "-F", "#{pane_pid}",
+    ], { timeout: 5000 });
+    const panePid = paneCmd.trim().split("\n")[0];
+
+    if (!panePid) {
+      await ctx.reply("Could not find mayor's tmux pane PID.");
+      return;
+    }
+
+    // Find the claude process that is a child of the tmux pane
+    const { stdout: children } = await execFileAsync("pgrep", [
+      "-P", panePid,
+    ], { timeout: 5000 });
+    const childPids = children.trim().split("\n").filter(Boolean);
+
+    if (childPids.length === 0) {
+      await ctx.reply(`No child processes found under pane PID ${panePid}.`);
+      return;
+    }
+
+    // Send SIGINT to all child processes (the claude process and its children)
+    for (const pid of childPids) {
+      try {
+        process.kill(parseInt(pid), "SIGINT");
+      } catch (e) {
+        // Process may have already exited
+      }
+    }
+    await ctx.reply(`Sent SIGINT to ${childPids.length} process(es) under mayor pane (PID ${panePid}). The mayor session should interrupt.`);
+    console.log(`SIGINT sent to PIDs: ${childPids.join(", ")} (parent pane: ${panePid})`);
+  } catch (err) {
+    console.error("SIGINT failed:", err.message);
+    await ctx.reply(`SIGINT failed: ${err.message.slice(0, 200)}`);
+  }
+});
+
 // --- Mayor busy detection and auto-reply ---
 
 async function checkMayorAvailable() {
