@@ -23,8 +23,10 @@ const { Bot } = require("grammy");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const http = require("http");
+const https = require("https");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 
 const execFileAsync = promisify(execFile);
 
@@ -345,6 +347,118 @@ bot.on("message:text", async (ctx) => {
   } catch (err) {
     console.error("Failed to forward message to mayor:", err.message);
     await ctx.reply("Failed to deliver message to Gas Town. Error logged.");
+  }
+});
+
+// --- Inbound: Voice/audio messages -> transcribe -> gt mail ---
+
+async function downloadTelegramFile(filePath) {
+  const url = `https://api.telegram.org/file/bot${TOKEN}/${filePath}`;
+  return new Promise((resolve, reject) => {
+    const tmpFile = path.join(os.tmpdir(), `crow-voice-${Date.now()}.ogg`);
+    const file = fs.createWriteStream(tmpFile);
+    https.get(url, (response) => {
+      if (response.statusCode !== 200) {
+        reject(new Error(`Download failed: HTTP ${response.statusCode}`));
+        return;
+      }
+      response.pipe(file);
+      file.on("finish", () => { file.close(); resolve(tmpFile); });
+    }).on("error", (err) => {
+      fs.unlink(tmpFile, () => {});
+      reject(err);
+    });
+  });
+}
+
+async function transcribeAudio(audioPath) {
+  // Run whisper CLI, output as plain text to stdout
+  const { stdout } = await execFileAsync("whisper", [
+    audioPath,
+    "--model", "base",
+    "--output_format", "txt",
+    "--output_dir", os.tmpdir(),
+  ], { timeout: 120000 });
+
+  // Whisper writes a .txt file next to the output dir
+  const baseName = path.basename(audioPath, path.extname(audioPath));
+  const txtFile = path.join(os.tmpdir(), `${baseName}.txt`);
+  try {
+    const text = fs.readFileSync(txtFile, "utf8").trim();
+    fs.unlink(txtFile, () => {}); // cleanup
+    return text;
+  } catch {
+    // Fallback: parse stdout if txt file not found
+    return stdout.trim();
+  }
+}
+
+bot.on(["message:voice", "message:audio"], async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  if (!isAuthorized(chatId)) {
+    console.log(`Ignoring voice message from unauthorized chat ${chatId}`);
+    return;
+  }
+
+  const from = ctx.from?.first_name || ctx.from?.username || "unknown";
+  const allowedRigs = getAllowedRigs(chatId);
+  const rigScope = allowedRigs.includes("*") ? null : allowedRigs;
+  const duration = ctx.message.voice?.duration || ctx.message.audio?.duration || 0;
+
+  await ctx.reply("Transcribing voice message...");
+
+  let audioPath;
+  try {
+    // Download the audio file from Telegram
+    const file = await ctx.getFile();
+    audioPath = await downloadTelegramFile(file.file_path);
+
+    // Transcribe with Whisper
+    const transcription = await transcribeAudio(audioPath);
+
+    if (!transcription) {
+      await ctx.reply("Could not transcribe audio — no speech detected.");
+      return;
+    }
+
+    // Forward to Mayor like a regular message, with voice note indicator
+    const rigTag = rigScope ? ` [rigs:${rigScope.join(",")}]` : "";
+    const subject = `Telegram from ${from}${rigTag} [voice ${duration}s]: ${transcription.slice(0, 50)}`;
+
+    let body = `[Transcribed from voice message, ${duration}s]\n\n${transcription}`;
+    if (rigScope) {
+      body = `[Chat ${chatId} — access: ${rigScope.join(", ")}]\n[From: ${from}]\n[Transcribed from voice message, ${duration}s]\n\n${transcription}`;
+    }
+
+    await gtMailSend("mayor/", subject, body);
+
+    // Nudge the Mayor
+    const nudgeText = rigScope
+      ? `[Telegram voice from ${from} (${rigScope.join(",")} only)]: ${transcription}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply","chat":"${chatId}"}'`
+      : `[Telegram voice from ${from}]: ${transcription}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply"}'`;
+    try {
+      await execFileAsync("gt", ["nudge", "mayor", nudgeText], { timeout: 10000 });
+    } catch (nudgeErr) {
+      console.error("Voice nudge failed (non-fatal):", nudgeErr.message);
+      if (!mayorBusy) {
+        mayorBusy = true;
+        try {
+          await ctx.reply("Mayor is currently working. Your voice message has been delivered — they'll see it shortly.");
+        } catch (replyErr) {
+          console.error("Failed to send busy auto-reply:", replyErr.message);
+        }
+        startMayorWatch();
+      }
+    }
+
+    await ctx.reply(`Transcribed: "${transcription.slice(0, 200)}${transcription.length > 200 ? "..." : ""}"`);
+    console.log(`Voice message from ${from}: transcribed ${duration}s -> "${transcription.slice(0, 60)}"`);
+  } catch (err) {
+    console.error("Voice transcription failed:", err.message);
+    await ctx.reply(`Voice transcription failed: ${err.message.slice(0, 200)}`);
+  } finally {
+    // Clean up temp audio file
+    if (audioPath) fs.unlink(audioPath, () => {});
   }
 });
 
