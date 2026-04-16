@@ -9,12 +9,15 @@
 //
 // Env vars:
 //   TELEGRAM_BOT_TOKEN  — required, from BotFather
-//   TELEGRAM_CHAT_IDS   — comma-separated list of authorized chat IDs
-//   TELEGRAM_CHAT_ID    — legacy single chat ID (fallback if TELEGRAM_CHAT_IDS not set)
-//   TELEGRAM_ADMIN_ID   — chat ID for admin-only commands (/handoff, /kill)
+//   TELEGRAM_CHAT_ID    — required, admin chat (receives all messages)
+//   TELEGRAM_ADMIN_ID   — optional, admin chat ID (defaults to TELEGRAM_CHAT_ID)
 //   CROW_PORT           — optional, HTTP API port (default: 3333)
 //   POLL_INTERVAL_MS    — optional, inbox poll interval (default: 30000)
 //   MAYOR_CHECK_INTERVAL_MS — optional, busy-mayor recheck interval (default: 15000)
+//
+// Chat permissions loaded from permissions.json (same directory as bot.js).
+// Format: { "<chat_id>": { "role": "admin"|"user", "rigs": ["*"] | ["mealpal"] } }
+// Chats not listed are ignored (unauthorized).
 
 const { Bot } = require("grammy");
 const { execFile } = require("child_process");
@@ -26,21 +29,58 @@ const path = require("path");
 const execFileAsync = promisify(execFile);
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_ID || CHAT_ID;
 const CROW_PORT = parseInt(process.env.CROW_PORT || "3333", 10);
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
 
-// Multi-chat support: TELEGRAM_CHAT_IDS (comma-separated) takes precedence,
-// falls back to legacy TELEGRAM_CHAT_ID for backward compatibility.
-const AUTHORIZED_CHAT_IDS = new Set(
-  (process.env.TELEGRAM_CHAT_IDS || process.env.TELEGRAM_CHAT_ID || "")
-    .split(",")
-    .map((id) => id.trim())
-    .filter(Boolean)
-);
+// --- Chat permissions ---
+const PERMISSIONS_FILE = path.join(__dirname, "permissions.json");
 
-// Admin-only commands (/handoff, /kill) restricted to this chat ID.
-// Falls back to TELEGRAM_CHAT_ID (the original single-user setup).
-const ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_ID || process.env.TELEGRAM_CHAT_ID || "";
+function loadPermissions() {
+  try {
+    return JSON.parse(fs.readFileSync(PERMISSIONS_FILE, "utf8"));
+  } catch (err) {
+    console.warn("Could not load permissions.json, falling back to admin-only:", err.message);
+    // Fallback: only admin chat, full access
+    return { [ADMIN_CHAT_ID]: { role: "admin", rigs: ["*"] } };
+  }
+}
+
+let chatPermissions = loadPermissions();
+
+function isAuthorized(chatId) {
+  return chatId in chatPermissions;
+}
+
+function isAdmin(chatId) {
+  const perm = chatPermissions[chatId];
+  return perm && perm.role === "admin";
+}
+
+function getAllowedRigs(chatId) {
+  const perm = chatPermissions[chatId];
+  if (!perm) return [];
+  return perm.rigs || [];
+}
+
+function hasRigAccess(chatId, rig) {
+  const rigs = getAllowedRigs(chatId);
+  return rigs.includes("*") || rigs.includes(rig);
+}
+
+// Get all chat IDs that have access to a given rig
+function chatsForRig(rig) {
+  return Object.entries(chatPermissions)
+    .filter(([, perm]) => perm.rigs.includes("*") || perm.rigs.includes(rig))
+    .map(([id]) => id);
+}
+
+// Reload permissions on SIGHUP for live updates
+process.on("SIGHUP", () => {
+  chatPermissions = loadPermissions();
+  console.log("Reloaded permissions.json");
+});
 
 // --- Lifecycle event notifications ---
 const EVENTS_FILE = path.join(process.env.HOME || "/home/nando", "gt", ".events.jsonl");
@@ -51,8 +91,8 @@ if (!TOKEN) {
   process.exit(1);
 }
 
-if (AUTHORIZED_CHAT_IDS.size === 0) {
-  console.error("TELEGRAM_CHAT_IDS or TELEGRAM_CHAT_ID is required");
+if (!CHAT_ID) {
+  console.error("TELEGRAM_CHAT_ID is required (used as default admin chat)");
   process.exit(1);
 }
 
@@ -108,7 +148,10 @@ async function gtMailRead(id) {
 
 bot.command("handoff", async (ctx) => {
   const chatId = String(ctx.chat.id);
-  if (chatId !== ADMIN_CHAT_ID) return;
+  if (!isAdmin(chatId)) {
+    if (isAuthorized(chatId)) await ctx.reply("Only admin chats can use /handoff.");
+    return;
+  }
 
   await ctx.reply("Requesting mayor handoff (soft)...");
   try {
@@ -127,7 +170,10 @@ bot.command("handoff", async (ctx) => {
 
 bot.command("kill", async (ctx) => {
   const chatId = String(ctx.chat.id);
-  if (chatId !== ADMIN_CHAT_ID) return;
+  if (!isAdmin(chatId)) {
+    if (isAuthorized(chatId)) await ctx.reply("Only admin chats can use /kill.");
+    return;
+  }
 
   await ctx.reply("Hard-killing mayor and spawning a fresh session...");
   try {
@@ -182,7 +228,7 @@ async function startMayorWatch() {
       clearInterval(mayorCheckTimer);
       mayorCheckTimer = null;
       try {
-        await sendToAllChats("Mayor is back and available.");
+        await bot.api.sendMessage(ADMIN_CHAT_ID, "Mayor is back and available.");
         console.log("Mayor available again — notified Telegram");
       } catch (err) {
         console.error("Failed to send mayor-available notice:", err.message);
@@ -195,23 +241,36 @@ async function startMayorWatch() {
 
 bot.on("message:text", async (ctx) => {
   const chatId = String(ctx.chat.id);
-  if (!AUTHORIZED_CHAT_IDS.has(chatId)) {
+  if (!isAuthorized(chatId)) {
     console.log(`Ignoring message from unauthorized chat ${chatId}`);
     return;
   }
 
   const from = ctx.from?.first_name || ctx.from?.username || "unknown";
   const text = ctx.message.text;
-  const subject = `Telegram from ${from}: ${text.slice(0, 60)}`;
+  const allowedRigs = getAllowedRigs(chatId);
+  const rigScope = allowedRigs.includes("*") ? null : allowedRigs;
+
+  // Tag subject with rig scope for non-admin chats
+  const rigTag = rigScope ? ` [rigs:${rigScope.join(",")}]` : "";
+  const subject = `Telegram from ${from}${rigTag}: ${text.slice(0, 60)}`;
+
+  // Build body with rig context for the mayor
+  let body = text;
+  if (rigScope) {
+    body = `[Chat ${chatId} — access: ${rigScope.join(", ")}]\n[From: ${from}]\n\n${text}`;
+  }
 
   try {
-    await gtMailSend("mayor/", subject, text);
+    await gtMailSend("mayor/", subject, body);
     // Nudge the Mayor so they see it immediately (no polling delay)
     let nudgeOk = false;
+    const nudgeText = rigScope
+      ? `[Telegram from ${from} (${rigScope.join(",")} only)]: ${text}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply","chat":"${chatId}"}'`
+      : `[Telegram from ${from}]: ${text}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply"}'`;
     try {
       await execFileAsync("gt", [
-        "nudge", "mayor",
-        `[Telegram from ${from}]: ${text}\n\nReply via: curl -s -X POST http://localhost:3333/send -H 'Content-Type: application/json' -d '{"message":"your reply"}'`,
+        "nudge", "mayor", nudgeText,
       ], { timeout: 10000 });
       nudgeOk = true;
     } catch (nudgeErr) {
@@ -228,7 +287,6 @@ bot.on("message:text", async (ctx) => {
       }
       startMayorWatch();
     } else if (!nudgeOk && mayorBusy) {
-      // Already notified about busy status, just acknowledge receipt
       try {
         await ctx.reply("Message delivered. Mayor is still busy — will notify you when they're available.");
       } catch (replyErr) {
@@ -274,7 +332,7 @@ async function pollInbox() {
       const sender = formatSender(msg.from || msg.sender || "unknown");
       const text = `${escapeMarkdown(sender)}: ${escapeMarkdown(subject)}\n\n${escapeMarkdown(body)}`;
 
-      await sendToAllChats(text, { parse_mode: "MarkdownV2" });
+      await bot.api.sendMessage(ADMIN_CHAT_ID, text, { parse_mode: "MarkdownV2" });
       console.log(`Sent to Telegram: [${id}] ${subject}`);
     }
   } catch (err) {
@@ -316,7 +374,7 @@ async function pollInboxText() {
 
       const text = `${escapeMarkdown(sender)}: ${escapeMarkdown(subject)}\n\n${escapeMarkdown(body)}`;
 
-      await sendToAllChats(text, { parse_mode: "MarkdownV2" });
+      await bot.api.sendMessage(ADMIN_CHAT_ID, text, { parse_mode: "MarkdownV2" });
       console.log(`Sent to Telegram: [${id}] ${subject}`);
     }
   } catch (err) {
@@ -369,22 +427,44 @@ const httpServer = http.createServer(async (req, res) => {
     req.on("data", (chunk) => { body += chunk; });
     req.on("end", async () => {
       try {
-        const { message, target } = JSON.parse(body);
+        const { message, chat, rig } = JSON.parse(body);
         if (!message) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "message field required" }));
           return;
         }
-        if (target) {
-          // Send to a specific chat ID
-          await bot.api.sendMessage(target, message);
+
+        // Determine target chat(s):
+        // - chat: send to specific chat ID
+        // - rig: send to all chats with access to that rig
+        // - neither: send to admin chat (default)
+        let targetChats;
+        if (chat) {
+          targetChats = [String(chat)];
+        } else if (rig) {
+          targetChats = chatsForRig(rig);
+          if (targetChats.length === 0) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: `no chats have access to rig: ${rig}` }));
+            return;
+          }
         } else {
-          // Send to all authorized chats
-          await sendToAllChats(message);
+          targetChats = [ADMIN_CHAT_ID];
         }
-        console.log(`HTTP /send: "${message.slice(0, 60)}..." (target: ${target || "all"})`);
+
+        const results = [];
+        for (const targetId of targetChats) {
+          try {
+            await bot.api.sendMessage(targetId, message);
+            results.push({ chat: targetId, ok: true });
+          } catch (sendErr) {
+            results.push({ chat: targetId, ok: false, error: sendErr.message });
+          }
+        }
+
+        console.log(`HTTP /send: "${message.slice(0, 60)}..." -> ${targetChats.join(",")}`);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.end(JSON.stringify({ ok: true, delivered: results }));
       } catch (err) {
         console.error("HTTP /send error:", err.message);
         res.writeHead(500, { "Content-Type": "application/json" });
@@ -495,7 +575,7 @@ function watchEvents() {
           if (!NOTIFY_EVENT_TYPES.has(evt.type)) continue;
           const msg = formatEventMessage(evt);
           if (msg) {
-            sendToAllChats(msg).then(
+            bot.api.sendMessage(ADMIN_CHAT_ID, msg).then(
               () => console.log(`Event notify: ${msg}`),
               (err) => console.error("Event notify error:", err.message)
             );
@@ -538,8 +618,8 @@ let pollTimer;
 
 async function start() {
   console.log("Crow Telegram Bot starting...");
-  console.log(`Authorized chat IDs: ${[...AUTHORIZED_CHAT_IDS].join(", ")}`);
-  console.log(`Admin chat ID: ${ADMIN_CHAT_ID}`);
+  console.log(`Admin chat: ${ADMIN_CHAT_ID}`);
+  console.log(`Authorized chats: ${Object.keys(chatPermissions).join(", ")}`);
   console.log(`Poll interval: ${POLL_INTERVAL}ms`);
 
   await seedSeenMails();
