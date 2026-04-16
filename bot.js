@@ -3,23 +3,26 @@
 // Crow Telegram Bot
 // Bridges messages between Telegram and Gas Town's gt mail system.
 //
-// Inbound:  Telegram message -> gt mail send mayor/ -s "..." --stdin
-// Outbound: Poll crow/ inbox  -> forward new messages to Telegram
+// Inbound:  Telegram message -> gt nudge mayor + gt mail (durable record)
+// Outbound: HTTP API on CROW_PORT for instant delivery, mail poll as fallback
 //
 // Env vars:
 //   TELEGRAM_BOT_TOKEN  — required, from BotFather
 //   TELEGRAM_CHAT_ID    — required, the chat to bridge messages to/from
-//   POLL_INTERVAL_MS    — optional, inbox poll interval (default: 15000)
+//   CROW_PORT           — optional, HTTP API port (default: 3333)
+//   POLL_INTERVAL_MS    — optional, inbox poll interval (default: 30000)
 
 const { Bot } = require("grammy");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
+const http = require("http");
 
 const execFileAsync = promisify(execFile);
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS || "15000", 10);
+const CROW_PORT = parseInt(process.env.CROW_PORT || "3333", 10);
+const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
 
 if (!TOKEN) {
   console.error("TELEGRAM_BOT_TOKEN is required");
@@ -93,7 +96,7 @@ bot.on("message:text", async (ctx) => {
     try {
       await execFileAsync("gt", [
         "nudge", "mayor",
-        `[Telegram from ${from}]: ${text}\n\nReply via: gt mail send crow -s "reply" -m "your message"`,
+        `[Telegram from ${from}]: ${text}\n\nReply via: curl -s -X POST http://localhost:3333/send -H 'Content-Type: application/json' -d '{"message":"your reply"}'`,
       ], { timeout: 10000 });
     } catch (nudgeErr) {
       console.error("Nudge failed (non-fatal):", nudgeErr.message);
@@ -223,6 +226,39 @@ function formatSender(sender) {
   return `[${clean}]`;
 }
 
+// --- HTTP API for instant outbound messages ---
+
+const httpServer = http.createServer(async (req, res) => {
+  if (req.method === "POST" && req.url === "/send") {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", async () => {
+      try {
+        const { message } = JSON.parse(body);
+        if (!message) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "message field required" }));
+          return;
+        }
+        await bot.api.sendMessage(CHAT_ID, message);
+        console.log(`HTTP /send: "${message.slice(0, 60)}..."`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        console.error("HTTP /send error:", err.message);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+  } else if (req.method === "GET" && req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", uptime: process.uptime() }));
+  } else {
+    res.writeHead(404);
+    res.end("Not found");
+  }
+});
+
 // --- Lifecycle ---
 
 async function seedSeenMails() {
@@ -257,6 +293,10 @@ async function start() {
 
   bot.start({
     onStart: () => console.log("Bot connected to Telegram"),
+  });
+
+  httpServer.listen(CROW_PORT, () => {
+    console.log(`HTTP API on http://localhost:${CROW_PORT}/send`);
   });
 
   pollTimer = setInterval(pollInbox, POLL_INTERVAL);
