@@ -352,10 +352,12 @@ bot.on("message:text", async (ctx) => {
 
 // --- Inbound: Voice/audio messages -> transcribe -> gt mail ---
 
-async function downloadTelegramFile(filePath) {
+const INCOMING_DIR = path.join(process.env.HOME || "/home/nando", "incoming");
+
+async function downloadTelegramFile(filePath, destPath) {
   const url = `https://api.telegram.org/file/bot${TOKEN}/${filePath}`;
   return new Promise((resolve, reject) => {
-    const tmpFile = path.join(os.tmpdir(), `crow-voice-${Date.now()}.ogg`);
+    const tmpFile = destPath || path.join(os.tmpdir(), `crow-voice-${Date.now()}.ogg`);
     const file = fs.createWriteStream(tmpFile);
     https.get(url, (response) => {
       if (response.statusCode !== 200) {
@@ -459,6 +461,72 @@ bot.on(["message:voice", "message:audio"], async (ctx) => {
   } finally {
     // Clean up temp audio file
     if (audioPath) fs.unlink(audioPath, () => {});
+  }
+});
+
+// --- Inbound: File/document/photo messages -> save to ~/incoming ---
+
+bot.on(["message:document", "message:photo"], async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  if (!isAuthorized(chatId)) {
+    console.log(`Ignoring file from unauthorized chat ${chatId}`);
+    return;
+  }
+
+  const from = ctx.from?.first_name || ctx.from?.username || "unknown";
+  const allowedRigs = getAllowedRigs(chatId);
+  const rigScope = allowedRigs.includes("*") ? null : allowedRigs;
+  const caption = ctx.message.caption || "";
+
+  try {
+    let file, fileName;
+    if (ctx.message.document) {
+      file = await ctx.getFile();
+      fileName = ctx.message.document.file_name || `file-${Date.now()}`;
+    } else {
+      // Photo — get the largest resolution
+      const photos = ctx.message.photo;
+      file = await ctx.api.getFile(photos[photos.length - 1].file_id);
+      fileName = `photo-${Date.now()}.jpg`;
+    }
+
+    // Ensure incoming dir exists
+    fs.mkdirSync(INCOMING_DIR, { recursive: true });
+
+    // Avoid overwriting — add timestamp if file exists
+    let destPath = path.join(INCOMING_DIR, fileName);
+    if (fs.existsSync(destPath)) {
+      const ext = path.extname(fileName);
+      const base = path.basename(fileName, ext);
+      destPath = path.join(INCOMING_DIR, `${base}-${Date.now()}${ext}`);
+    }
+
+    await downloadTelegramFile(file.file_path, destPath);
+
+    // Mail the mayor with file path
+    const rigTag = rigScope ? ` [rigs:${rigScope.join(",")}]` : "";
+    const subject = `Telegram file from ${from}${rigTag}: ${fileName}`;
+    let body = `File saved to: ${destPath}`;
+    if (caption) body += `\nCaption: ${caption}`;
+    if (rigScope) {
+      body = `[Chat ${chatId} — access: ${rigScope.join(", ")}]\n[From: ${from}]\n${body}`;
+    }
+
+    await gtMailSend("mayor/", subject, body);
+
+    // Nudge
+    const nudgeText = `[Telegram file from ${from}]: ${fileName} saved to ${destPath}${caption ? ` — "${caption}"` : ""}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply","chat":"${chatId}"}'`;
+    try {
+      await execFileAsync("gt", ["nudge", "mayor", nudgeText], { timeout: 10000 });
+    } catch (nudgeErr) {
+      console.error("File nudge failed (non-fatal):", nudgeErr.message);
+    }
+
+    await ctx.reply(`File saved: ${path.basename(destPath)}`);
+    console.log(`File from ${from}: ${fileName} -> ${destPath}`);
+  } catch (err) {
+    console.error("File download failed:", err.message);
+    await ctx.reply(`File download failed: ${err.message.slice(0, 200)}`);
   }
 });
 
