@@ -5,3 +5,4 @@ __pycache__/
 state.json
 node_modules/
 .env
+.beads/
