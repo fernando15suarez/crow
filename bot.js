@@ -19,7 +19,7 @@
 // Format: { "<chat_id>": { "role": "admin"|"user", "rigs": ["*"] | ["mealpal"] } }
 // Chats not listed are ignored (unauthorized).
 
-const { Bot } = require("grammy");
+const { Bot, InputFile } = require("grammy");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const http = require("http");
@@ -696,6 +696,45 @@ const httpServer = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: true, delivered: results }));
       } catch (err) {
         console.error("HTTP /send error:", err.message);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+  } else if (req.method === "POST" && req.url === "/sendfile") {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", async () => {
+      try {
+        const { path: filePath, chat, caption } = JSON.parse(body);
+        if (!filePath) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "path field required" }));
+          return;
+        }
+
+        if (!fs.existsSync(filePath)) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: `file not found: ${filePath}` }));
+          return;
+        }
+
+        const targetChat = chat ? String(chat) : ADMIN_CHAT_ID;
+        const ext = path.extname(filePath).toLowerCase();
+        const isImage = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"].includes(ext);
+        const input = new InputFile(filePath);
+        const opts = caption ? { caption } : {};
+
+        if (isImage) {
+          await bot.api.sendPhoto(targetChat, input, opts);
+        } else {
+          await bot.api.sendDocument(targetChat, input, opts);
+        }
+
+        console.log(`HTTP /sendfile: ${filePath} -> ${targetChat} (${isImage ? "photo" : "document"})`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, chat: targetChat, method: isImage ? "sendPhoto" : "sendDocument" }));
+      } catch (err) {
+        console.error("HTTP /sendfile error:", err.message);
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
