@@ -22,6 +22,7 @@ Create a `.env` file:
 | `TELEGRAM_CHAT_IDS` | No | Comma-separated chat IDs to bridge (default: just CHAT_ID) |
 | `TELEGRAM_ADMIN_ID` | No | Admin chat ID for privileged commands (default: CHAT_ID) |
 | `POLL_INTERVAL_MS` | No | Inbox poll interval in ms (default: 30000) |
+| `GT_ROOT` | No | Gas Town root dir (default: `$HOME/gt` if present). Unset if Gas Town isn't installed. |
 
 ## Running
 
@@ -118,5 +119,26 @@ Crow supports multiple Telegram chats with per-chat permissions via `permissions
 ## Requirements
 
 - Node.js 18+
-- Gas Town (`gt`) installed and configured (for mail, nudge, handoff commands)
-- `tmux` (for /sigint command to find mayor process)
+- Gas Town (`gt`) installed and configured — optional. Without it, Crow runs as a plain Telegram bot (HTTP `/send` and `/sendfile` still work, but mail forwarding, mayor nudges, and lifecycle events are disabled).
+- `tmux` (only needed for the `/sigint` command)
+
+## Cloning to another PC
+
+Each Crow instance needs its own Telegram bot (Telegram disallows a bot token running from two places). Rough order of operations:
+
+1. **Create a bot with BotFather.** Message [@BotFather](https://t.me/BotFather) on Telegram, run `/newbot`, and copy the token.
+2. **Find your chat ID.** Send any message to the new bot, then visit `https://api.telegram.org/bot<TOKEN>/getUpdates` and grab the `chat.id`. For group chats the ID is negative.
+3. **Clone and install:**
+   ```bash
+   git clone https://github.com/fernando15suarez/crow.git
+   cd crow
+   npm install
+   cp .env.example .env
+   ```
+4. **Fill in `.env`** with your token and chat ID.
+5. **(Optional) Gas Town setup.** If you're using Gas Town, make sure `gt` is on `PATH`. If Gas Town lives somewhere other than `~/gt`, set `GT_ROOT=/path/to/gt` in `.env`. If you don't use Gas Town, leave `GT_ROOT` unset — Crow will start up without the mail/nudge/event features.
+6. **(Optional) `permissions.json`** if you want multiple chats or rig-scoped access. If absent, Crow falls back to admin-only for `TELEGRAM_ADMIN_ID`.
+7. **Run it** with `npm start`, or set up the systemd service below.
+8. **Systemd service:** edit the unit in the section above so `WorkingDirectory` and `EnvironmentFile` point at the new checkout. If Gas Town runs from a non-standard path, add `Environment=GT_ROOT=/path/to/gt` to the `[Service]` block (or just put `GT_ROOT=...` in `.env`).
+
+`GET /health` returns `gas_town.available` so you can confirm which mode Crow is running in.

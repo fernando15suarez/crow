@@ -7,6 +7,10 @@
 // Outbound: HTTP API on CROW_PORT for instant delivery, mail poll as fallback
 // Events:   Watches .events.jsonl for lifecycle events (done, sling, spawn)
 //
+// If Gas Town (`gt`) is not installed, Crow runs as a plain Telegram bot:
+// the HTTP /send and /sendfile endpoints still work, but mail forwarding,
+// nudges, and lifecycle event notifications are disabled.
+//
 // Env vars:
 //   TELEGRAM_BOT_TOKEN  — required, from BotFather
 //   TELEGRAM_CHAT_ID    — required, admin chat (receives all messages)
@@ -14,13 +18,14 @@
 //   CROW_PORT           — optional, HTTP API port (default: 3333)
 //   POLL_INTERVAL_MS    — optional, inbox poll interval (default: 30000)
 //   MAYOR_CHECK_INTERVAL_MS — optional, busy-mayor recheck interval (default: 15000)
+//   GT_ROOT             — optional, Gas Town root dir (default: $HOME/gt if present)
 //
 // Chat permissions loaded from permissions.json (same directory as bot.js).
 // Format: { "<chat_id>": { "role": "admin"|"user", "rigs": ["*"] | ["mealpal"] } }
 // Chats not listed are ignored (unauthorized).
 
 const { Bot, InputFile } = require("grammy");
-const { execFile } = require("child_process");
+const { execFile, execFileSync } = require("child_process");
 const { promisify } = require("util");
 const http = require("http");
 const https = require("https");
@@ -29,6 +34,35 @@ const path = require("path");
 const os = require("os");
 
 const execFileAsync = promisify(execFile);
+
+// --- Gas Town availability ---
+// Crow can run standalone without Gas Town — mail/nudge/event features
+// just disable gracefully in that case.
+
+function detectGtCli() {
+  try {
+    execFileSync("gt", ["--help"], { stdio: "ignore", timeout: 3000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function detectGtRoot() {
+  // 1. Explicit env var (set by `gt prime` and settable in .env)
+  if (process.env.GT_ROOT) return process.env.GT_ROOT;
+  // 2. Standard ~/gt location, only if it actually exists
+  const defaultRoot = path.join(process.env.HOME || "/home", "gt");
+  try {
+    if (fs.statSync(defaultRoot).isDirectory()) return defaultRoot;
+  } catch {
+    // doesn't exist
+  }
+  return null;
+}
+
+const GT_AVAILABLE = detectGtCli();
+const GT_ROOT = detectGtRoot();
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -85,7 +119,7 @@ process.on("SIGHUP", () => {
 });
 
 // --- Lifecycle event notifications ---
-const EVENTS_FILE = path.join(process.env.HOME || "/home/nando", "gt", ".events.jsonl");
+const EVENTS_FILE = GT_ROOT ? path.join(GT_ROOT, ".events.jsonl") : null;
 const NOTIFY_EVENT_TYPES = new Set(["done", "sling", "spawn"]);
 
 if (!TOKEN) {
@@ -154,6 +188,10 @@ bot.command("handoff", async (ctx) => {
     if (isAuthorized(chatId)) await ctx.reply("Only admin chats can use /handoff.");
     return;
   }
+  if (!GT_AVAILABLE) {
+    await ctx.reply("Gas Town (gt) is not installed on this instance — /handoff unavailable.");
+    return;
+  }
 
   await ctx.reply("Requesting mayor handoff (soft)...");
   try {
@@ -174,6 +212,10 @@ bot.command("kill", async (ctx) => {
   const chatId = String(ctx.chat.id);
   if (!isAdmin(chatId)) {
     if (isAuthorized(chatId)) await ctx.reply("Only admin chats can use /kill.");
+    return;
+  }
+  if (!GT_AVAILABLE) {
+    await ctx.reply("Gas Town (gt) is not installed on this instance — /kill unavailable.");
     return;
   }
 
@@ -241,6 +283,7 @@ bot.command("sigint", async (ctx) => {
 // --- Mayor busy detection and auto-reply ---
 
 async function checkMayorAvailable() {
+  if (!GT_AVAILABLE) return false;
   try {
     // Use wait-idle nudge with a short timeout to probe availability
     // A silent probe — the mayor sees nothing if idle
@@ -292,6 +335,11 @@ bot.on("message:text", async (ctx) => {
   const chatId = String(ctx.chat.id);
   if (!isAuthorized(chatId)) {
     console.log(`Ignoring message from unauthorized chat ${chatId}`);
+    return;
+  }
+
+  if (!GT_AVAILABLE) {
+    await ctx.reply("Gas Town is not available on this Crow instance. Your message was received but there's no mayor to forward it to.");
     return;
   }
 
@@ -402,6 +450,11 @@ bot.on(["message:voice", "message:audio"], async (ctx) => {
     return;
   }
 
+  if (!GT_AVAILABLE) {
+    await ctx.reply("Gas Town is not available on this Crow instance — voice forwarding disabled.");
+    return;
+  }
+
   const from = ctx.from?.first_name || ctx.from?.username || "unknown";
   const allowedRigs = getAllowedRigs(chatId);
   const rigScope = allowedRigs.includes("*") ? null : allowedRigs;
@@ -503,23 +556,25 @@ bot.on(["message:document", "message:photo"], async (ctx) => {
 
     await downloadTelegramFile(file.file_path, destPath);
 
-    // Mail the mayor with file path
-    const rigTag = rigScope ? ` [rigs:${rigScope.join(",")}]` : "";
-    const subject = `Telegram file from ${from}${rigTag}: ${fileName}`;
-    let body = `File saved to: ${destPath}`;
-    if (caption) body += `\nCaption: ${caption}`;
-    if (rigScope) {
-      body = `[Chat ${chatId} — access: ${rigScope.join(", ")}]\n[From: ${from}]\n${body}`;
-    }
+    if (GT_AVAILABLE) {
+      // Mail the mayor with file path
+      const rigTag = rigScope ? ` [rigs:${rigScope.join(",")}]` : "";
+      const subject = `Telegram file from ${from}${rigTag}: ${fileName}`;
+      let body = `File saved to: ${destPath}`;
+      if (caption) body += `\nCaption: ${caption}`;
+      if (rigScope) {
+        body = `[Chat ${chatId} — access: ${rigScope.join(", ")}]\n[From: ${from}]\n${body}`;
+      }
 
-    await gtMailSend("mayor/", subject, body);
+      await gtMailSend("mayor/", subject, body);
 
-    // Nudge
-    const nudgeText = `[Telegram file from ${from}]: ${fileName} saved to ${destPath}${caption ? ` — "${caption}"` : ""}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply","chat":"${chatId}"}'`;
-    try {
-      await execFileAsync("gt", ["nudge", "mayor", nudgeText], { timeout: 10000 });
-    } catch (nudgeErr) {
-      console.error("File nudge failed (non-fatal):", nudgeErr.message);
+      // Nudge
+      const nudgeText = `[Telegram file from ${from}]: ${fileName} saved to ${destPath}${caption ? ` — "${caption}"` : ""}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply","chat":"${chatId}"}'`;
+      try {
+        await execFileAsync("gt", ["nudge", "mayor", nudgeText], { timeout: 10000 });
+      } catch (nudgeErr) {
+        console.error("File nudge failed (non-fatal):", nudgeErr.message);
+      }
     }
 
     await ctx.reply(`File saved: ${path.basename(destPath)}`);
@@ -533,6 +588,7 @@ bot.on(["message:document", "message:photo"], async (ctx) => {
 // --- Outbound: Poll inbox -> Telegram ---
 
 async function pollInbox() {
+  if (!GT_AVAILABLE) return;
   try {
     const messages = await gtMailInbox();
 
@@ -740,6 +796,11 @@ const httpServer = http.createServer(async (req, res) => {
       }
     });
   } else if (req.method === "POST" && req.url === "/handoff") {
+    if (!GT_AVAILABLE) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "gt not installed — handoff unavailable" }));
+      return;
+    }
     // Soft handoff: nudge the mayor to run /handoff
     try {
       await execFileAsync("gt", [
@@ -754,6 +815,11 @@ const httpServer = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: err.message }));
     }
   } else if (req.method === "POST" && req.url === "/kill") {
+    if (!GT_AVAILABLE) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "gt not installed — kill unavailable" }));
+      return;
+    }
     // Hard kill: gt handoff mayor (kills and respawns)
     try {
       const { stdout, stderr } = await execFileAsync("gt", [
@@ -767,7 +833,11 @@ const httpServer = http.createServer(async (req, res) => {
     }
   } else if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", uptime: process.uptime() }));
+    res.end(JSON.stringify({
+      status: "ok",
+      uptime: process.uptime(),
+      gas_town: GT_AVAILABLE ? { available: true, root: GT_ROOT } : { available: false },
+    }));
   } else {
     res.writeHead(404);
     res.end("Not found");
@@ -802,6 +872,11 @@ function formatEventMessage(evt) {
 }
 
 function watchEvents() {
+  if (!EVENTS_FILE) {
+    console.log("GT_ROOT not set — skipping lifecycle event watcher");
+    return null;
+  }
+
   let fileSize = 0;
 
   // Start from end of file so we don't replay history
@@ -812,7 +887,14 @@ function watchEvents() {
     console.log("Events file not found, will watch for creation");
   }
 
-  const watcher = fs.watch(path.dirname(EVENTS_FILE), (eventType, filename) => {
+  // Watch the parent directory — fs.watch on the file itself fails if it
+  // doesn't exist yet. Parent dir must exist though.
+  const watchDir = path.dirname(EVENTS_FILE);
+  if (!fs.existsSync(watchDir)) {
+    console.log(`Events dir ${watchDir} missing — skipping event watcher`);
+    return null;
+  }
+  const watcher = fs.watch(watchDir, (eventType, filename) => {
     if (filename !== path.basename(EVENTS_FILE)) return;
     processNewEvents();
   });
@@ -866,6 +948,7 @@ function watchEvents() {
 // --- Lifecycle ---
 
 async function seedSeenMails() {
+  if (!GT_AVAILABLE) return;
   // Mark all current inbox messages as "seen" so we don't replay history on startup
   try {
     const messages = await gtMailInbox();
@@ -893,6 +976,11 @@ async function start() {
   console.log(`Admin chat: ${ADMIN_CHAT_ID}`);
   console.log(`Authorized chats: ${Object.keys(chatPermissions).join(", ")}`);
   console.log(`Poll interval: ${POLL_INTERVAL}ms`);
+  if (GT_AVAILABLE) {
+    console.log(`Gas Town: available (root: ${GT_ROOT || "unknown"})`);
+  } else {
+    console.log("Gas Town: not available — running as plain Telegram bot (mail/nudge/events disabled)");
+  }
 
   await seedSeenMails();
 
@@ -904,10 +992,11 @@ async function start() {
     console.log(`HTTP API on http://localhost:${CROW_PORT}/send`);
   });
 
-  pollTimer = setInterval(pollInbox, POLL_INTERVAL);
-
-  // Watch lifecycle events for Telegram notifications
-  watchEvents();
+  if (GT_AVAILABLE) {
+    pollTimer = setInterval(pollInbox, POLL_INTERVAL);
+    // Watch lifecycle events for Telegram notifications
+    watchEvents();
+  }
 }
 
 function shutdown(signal) {
