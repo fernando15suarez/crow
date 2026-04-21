@@ -285,27 +285,30 @@ bot.command("sigint", async (ctx) => {
       return;
     }
 
-    // Find the claude process that is a child of the tmux pane
-    const { stdout: children } = await execFileAsync("pgrep", [
-      "-P", panePid,
-    ], { timeout: 5000 });
-    const childPids = children.trim().split("\n").filter(Boolean);
-
-    if (childPids.length === 0) {
-      await ctx.reply(`No child processes found under pane PID ${panePid}.`);
-      return;
+    // Find child processes of the tmux pane. pgrep exits 1 when no matches;
+    // treat that as an empty list rather than an error so we still signal pane_pid.
+    let childPids = [];
+    try {
+      const { stdout: children } = await execFileAsync("pgrep", [
+        "-P", panePid,
+      ], { timeout: 5000 });
+      childPids = children.trim().split("\n").filter(Boolean);
+    } catch (e) {
+      if (e.code !== 1) throw e;
     }
 
-    // Send SIGINT to all child processes (the claude process and its children)
-    for (const pid of childPids) {
+    // Signal pane_pid first (interrupts claude if it's the pane's direct process),
+    // then children (catches claude if it's nested under a shell, plus any hung subprocesses).
+    const pidsToSignal = [panePid, ...childPids];
+    for (const pid of pidsToSignal) {
       try {
         process.kill(parseInt(pid), "SIGINT");
       } catch (e) {
         // Process may have already exited
       }
     }
-    await ctx.reply(`Sent SIGINT to ${childPids.length} process(es) under mayor pane (PID ${panePid}) in tmux session '${MAYOR_TMUX_SESSION}'. The mayor session should interrupt.`);
-    console.log(`SIGINT sent to PIDs: ${childPids.join(", ")} (parent pane: ${panePid}, tmux session: ${MAYOR_TMUX_SESSION})`);
+    await ctx.reply(`Sent SIGINT to pane PID ${panePid} + ${childPids.length} child(ren) in tmux session '${MAYOR_TMUX_SESSION}'. The mayor session should interrupt.`);
+    console.log(`SIGINT sent to pane PID ${panePid} and child PIDs: [${childPids.join(", ")}] (tmux session: ${MAYOR_TMUX_SESSION})`);
   } catch (err) {
     console.error("SIGINT failed:", err.message);
     const msg = err.message || "";
