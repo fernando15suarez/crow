@@ -556,7 +556,7 @@ bot.on(["message:voice", "message:audio"], async (ctx) => {
 
 // --- Inbound: File/document/photo messages -> save to ~/incoming ---
 
-bot.on(["message:document", "message:photo"], async (ctx) => {
+bot.on(["message:document", "message:photo", "message:video", "message:animation", "message:video_note"], async (ctx) => {
   const chatId = String(ctx.chat.id);
   if (!isAuthorized(chatId)) {
     console.log(`Ignoring file from unauthorized chat ${chatId}`);
@@ -573,6 +573,20 @@ bot.on(["message:document", "message:photo"], async (ctx) => {
     if (ctx.message.document) {
       file = await ctx.getFile();
       fileName = ctx.message.document.file_name || `file-${Date.now()}`;
+    } else if (ctx.message.video) {
+      // Native Telegram video (sent via Gallery / video picker)
+      file = await ctx.api.getFile(ctx.message.video.file_id);
+      const ext = (ctx.message.video.mime_type && ctx.message.video.mime_type.split("/")[1]) || "mp4";
+      fileName = ctx.message.video.file_name || `video-${Date.now()}.${ext}`;
+    } else if (ctx.message.animation) {
+      // GIFs / silent looping clips
+      file = await ctx.api.getFile(ctx.message.animation.file_id);
+      const ext = (ctx.message.animation.mime_type && ctx.message.animation.mime_type.split("/")[1]) || "mp4";
+      fileName = ctx.message.animation.file_name || `animation-${Date.now()}.${ext}`;
+    } else if (ctx.message.video_note) {
+      // Telegram round-bubble video messages
+      file = await ctx.api.getFile(ctx.message.video_note.file_id);
+      fileName = `video-note-${Date.now()}.mp4`;
     } else {
       // Photo — get the largest resolution
       const photos = ctx.message.photo;
