@@ -22,6 +22,7 @@ Create a `.env` file:
 | `TELEGRAM_CHAT_IDS` | No | Comma-separated chat IDs to bridge (default: just CHAT_ID) |
 | `TELEGRAM_ADMIN_ID` | No | Admin chat ID for privileged commands (default: CHAT_ID) |
 | `POLL_INTERVAL_MS` | No | Inbox poll interval in ms (default: 30000) |
+| `MAYOR_TMUX_SESSION` | No | tmux session name for the mayor's Claude Code process, used by `/sigint` (default: `mayor`). Gas Town typically names this `<town-prefix>-mayor` (e.g. `hq-mayor`). |
 | `GT_ROOT` | No | Gas Town root dir (default: `$HOME/gt` if present). Unset if Gas Town isn't installed. |
 
 ## Running

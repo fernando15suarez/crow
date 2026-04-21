@@ -18,6 +18,7 @@
 //   CROW_PORT           — optional, HTTP API port (default: 3333)
 //   POLL_INTERVAL_MS    — optional, inbox poll interval (default: 30000)
 //   MAYOR_CHECK_INTERVAL_MS — optional, busy-mayor recheck interval (default: 15000)
+//   MAYOR_TMUX_SESSION  — optional, tmux session name for /sigint (default: "mayor")
 //   GT_ROOT             — optional, Gas Town root dir (default: $HOME/gt if present)
 //
 // Chat permissions loaded from permissions.json (same directory as bot.js).
@@ -69,6 +70,7 @@ const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const ADMIN_CHAT_ID = process.env.TELEGRAM_ADMIN_ID || CHAT_ID;
 const CROW_PORT = parseInt(process.env.CROW_PORT || "3333", 10);
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
+const MAYOR_TMUX_SESSION = process.env.MAYOR_TMUX_SESSION || "mayor";
 
 // --- Chat permissions ---
 const PERMISSIONS_FILE = path.join(__dirname, "permissions.json");
@@ -274,12 +276,12 @@ bot.command("sigint", async (ctx) => {
   try {
     // Find the mayor's claude process via tmux session
     const { stdout: paneCmd } = await execFileAsync("tmux", [
-      "list-panes", "-t", "mayor", "-F", "#{pane_pid}",
+      "list-panes", "-t", MAYOR_TMUX_SESSION, "-F", "#{pane_pid}",
     ], { timeout: 5000 });
     const panePid = paneCmd.trim().split("\n")[0];
 
     if (!panePid) {
-      await ctx.reply("Could not find mayor's tmux pane PID.");
+      await ctx.reply(`Could not find mayor's tmux pane PID in session '${MAYOR_TMUX_SESSION}'.`);
       return;
     }
 
@@ -302,11 +304,16 @@ bot.command("sigint", async (ctx) => {
         // Process may have already exited
       }
     }
-    await ctx.reply(`Sent SIGINT to ${childPids.length} process(es) under mayor pane (PID ${panePid}). The mayor session should interrupt.`);
-    console.log(`SIGINT sent to PIDs: ${childPids.join(", ")} (parent pane: ${panePid})`);
+    await ctx.reply(`Sent SIGINT to ${childPids.length} process(es) under mayor pane (PID ${panePid}) in tmux session '${MAYOR_TMUX_SESSION}'. The mayor session should interrupt.`);
+    console.log(`SIGINT sent to PIDs: ${childPids.join(", ")} (parent pane: ${panePid}, tmux session: ${MAYOR_TMUX_SESSION})`);
   } catch (err) {
     console.error("SIGINT failed:", err.message);
-    await ctx.reply(`SIGINT failed: ${err.message.slice(0, 200)}`);
+    const msg = err.message || "";
+    if (/can't find (window|session)/i.test(msg)) {
+      await ctx.reply(`No tmux session named '${MAYOR_TMUX_SESSION}' found. Set MAYOR_TMUX_SESSION in .env to your Gas Town mayor's tmux session (e.g. 'hq-mayor').`);
+    } else {
+      await ctx.reply(`SIGINT failed: ${msg.slice(0, 200)}`);
+    }
   }
 });
 
