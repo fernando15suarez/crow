@@ -233,6 +233,36 @@ bot.command("kill", async (ctx) => {
   }
 });
 
+bot.command("help", async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  if (!isAuthorized(chatId)) {
+    console.log(`Ignoring /help from unauthorized chat ${chatId}`);
+    return;
+  }
+  const helpText = [
+    "Crow — command reference",
+    "",
+    "Telegram commands:",
+    "  /help — show this message",
+    "  /handoff — soft mayor restart (admin)",
+    "  /kill — hard mayor restart (admin)",
+    "  /sigint — Ctrl+C mayor's Claude process (admin)",
+    "",
+    "Message types:",
+    "  text — forwarded to mayor as mail + nudge",
+    "  voice / audio — Whisper-transcribed, then forwarded",
+    "  document / photo — saved to ~/incoming, mayor notified",
+    "",
+    `HTTP endpoints (localhost:${CROW_PORT}, for mayor):`,
+    "  POST /send      — send text to Telegram",
+    "  POST /sendfile  — send file to Telegram",
+    "  POST /handoff   — trigger soft mayor handoff",
+    "  POST /kill      — hard mayor restart",
+    "  GET  /health    — health + uptime + gt status",
+  ].join("\n");
+  await ctx.reply(helpText);
+});
+
 bot.command("sigint", async (ctx) => {
   const chatId = String(ctx.chat.id);
   if (!isAdmin(chatId)) {

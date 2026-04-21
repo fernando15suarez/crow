@@ -72,6 +72,7 @@ journalctl --user -u crow -f     # Tail logs
 
 | Command | Access | Description |
 |---------|--------|-------------|
+| `/help` | Any authorized | Show command + endpoint reference |
 | `/handoff` | Admin | Soft mayor restart (nudges mayor to hand off) |
 | `/kill` | Admin | Hard mayor restart (forces `gt handoff`) |
 | `/sigint` | Admin | Emergency Ctrl+C to mayor process |
