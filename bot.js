@@ -439,8 +439,7 @@ bot.on("message:text", async (ctx) => {
     try {
       await execFileAsync("gt", [
         "nudge", "mayor", nudgeText,
-        "--mode", "queue",
-      ], { timeout: 10000 });
+      ], { timeout: 70000 });
       nudgeOk = true;
     } catch (nudgeErr) {
       console.error("Nudge failed (non-fatal):", nudgeErr.message);
@@ -564,7 +563,7 @@ bot.on(["message:voice", "message:audio"], async (ctx) => {
       ? `[Telegram voice from ${from} (${rigScope.join(",")} only)]: ${transcription}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply","chat":"${chatId}"}'`
       : `[Telegram voice from ${from}]: ${transcription}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply"}'`;
     try {
-      await execFileAsync("gt", ["nudge", "mayor", nudgeText, "--mode", "queue"], { timeout: 10000 });
+      await execFileAsync("gt", ["nudge", "mayor", nudgeText], { timeout: 70000 });
     } catch (nudgeErr) {
       console.error("Voice nudge failed (non-fatal):", nudgeErr.message);
       if (!mayorBusy) {
@@ -657,7 +656,7 @@ bot.on(["message:document", "message:photo", "message:video", "message:animation
       // Nudge
       const nudgeText = `[Telegram file from ${from}]: ${fileName} saved to ${destPath}${caption ? ` — "${caption}"` : ""}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply","chat":"${chatId}"}'`;
       try {
-        await execFileAsync("gt", ["nudge", "mayor", nudgeText, "--mode", "queue"], { timeout: 10000 });
+        await execFileAsync("gt", ["nudge", "mayor", nudgeText], { timeout: 70000 });
       } catch (nudgeErr) {
         console.error("File nudge failed (non-fatal):", nudgeErr.message);
       }
