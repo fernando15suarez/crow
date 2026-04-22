@@ -491,14 +491,23 @@ bot.on("message:text", async (ctx) => {
       ? `[Telegram from ${from} (${rigScope.join(",")} only)]: ${text}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply","chat":"${chatId}"}'`
       : `[Telegram from ${from}]: ${text}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply"}'`;
 
-    startBusyTimer(chatId, subject, ctx);
     try {
       await execFileAsync("gt", [
         "nudge", "mayor", "--mode", "immediate", nudgeText,
       ], { timeout: 10000 });
       nudgeOk = true;
+      // Immediate-mode send-keys returned exit 0: the text is in mayor's prompt
+      // box now. Fire a fast 'heard' ack to the user (<1s) instead of waiting
+      // for mayor to loop back through /heard.
+      cancelBusyTimer(chatId);
+      ctx.reply(`heard: ${text.slice(0, 50)}`).catch((err) => {
+        console.error("heard reply failed:", err.message);
+      });
     } catch (nudgeErr) {
       console.error("Nudge failed (non-fatal):", nudgeErr.message);
+      // Fallback: immediate delivery failed, so start the busy-timer to signal
+      // the user that something's wrong (mayor pane gone, gt misconfigured, etc).
+      startBusyTimer(chatId, subject, ctx);
     }
 
     // Nudge failure implies mayor is busy — keep the availability-watch machinery
@@ -609,11 +618,16 @@ bot.on(["message:voice", "message:audio"], async (ctx) => {
     const nudgeText = rigScope
       ? `[Telegram voice from ${from} (${rigScope.join(",")} only)]: ${transcription}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply","chat":"${chatId}"}'`
       : `[Telegram voice from ${from}]: ${transcription}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply"}'`;
-    startBusyTimer(chatId, subject, ctx);
     try {
       await execFileAsync("gt", ["nudge", "mayor", "--mode", "immediate", nudgeText], { timeout: 10000 });
+      // Send-keys delivered — fast 'heard' ack before the trailing Transcribed reply.
+      cancelBusyTimer(chatId);
+      ctx.reply(`heard: ${transcription.slice(0, 50)}`).catch((err) => {
+        console.error("heard reply failed:", err.message);
+      });
     } catch (nudgeErr) {
       console.error("Voice nudge failed (non-fatal):", nudgeErr.message);
+      startBusyTimer(chatId, subject, ctx);
       if (!mayorBusy) {
         mayorBusy = true;
         startMayorWatch();
@@ -698,11 +712,16 @@ bot.on(["message:document", "message:photo", "message:video", "message:animation
 
       // Nudge
       const nudgeText = `[Telegram file from ${from}]: ${fileName} saved to ${destPath}${caption ? ` — "${caption}"` : ""}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply","chat":"${chatId}"}'`;
-      startBusyTimer(chatId, subject, ctx);
       try {
         await execFileAsync("gt", ["nudge", "mayor", "--mode", "immediate", nudgeText], { timeout: 10000 });
+        // Send-keys delivered — fast 'heard' ack so the user knows mayor got it.
+        cancelBusyTimer(chatId);
+        ctx.reply(`heard: ${fileName.slice(0, 50)}`).catch((err) => {
+          console.error("heard reply failed:", err.message);
+        });
       } catch (nudgeErr) {
         console.error("File nudge failed (non-fatal):", nudgeErr.message);
+        startBusyTimer(chatId, subject, ctx);
       }
     }
 
