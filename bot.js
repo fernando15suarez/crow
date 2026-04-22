@@ -159,6 +159,59 @@ let mayorBusy = false;
 let mayorCheckTimer = null;
 let mayorProbeQueuedAt = 0; // timestamp of last probe that was queued (0 = none pending)
 
+// --- Fast busy-reply (cr-cgd) ---
+// When a Telegram message is forwarded to mayor, start a short timer. If /heard
+// doesn't arrive within MAYOR_BUSY_TIMEOUT_MS, mayor hasn't seen it yet — fire a
+// 'working on it' reply so the user gets feedback in ~5s instead of waiting
+// ~60s for wait-idle to time out.
+const MAYOR_BUSY_TIMEOUT_MS = parseInt(process.env.MAYOR_BUSY_TIMEOUT_MS || "5000", 10);
+// After firing a busy-reply for a chat, suppress further busy-replies from the
+// same chat for this window so rapid-fire messages get one reply per batch.
+const PENDING_ACK_COOLDOWN_MS = 30_000;
+const BUSY_REPLY_TEXT = "Mayor is currently working — your message is queued and will be answered shortly.";
+// chat id -> { timer, subject }. timer is null when we skipped scheduling due to cooldown.
+const pendingAcks = new Map();
+// chat id -> epoch ms until which busy-replies are suppressed.
+const busyReplyCooldown = new Map();
+
+function startBusyTimer(chatId, subject, ctx) {
+  const key = String(chatId);
+
+  // Overwrite any existing entry for this chat (rapid-fire messages).
+  const existing = pendingAcks.get(key);
+  if (existing && existing.timer) clearTimeout(existing.timer);
+
+  // Suppress the reply if we fired one recently — still track the entry so
+  // /heard can clean it up, but don't schedule a new reply.
+  if (Date.now() < (busyReplyCooldown.get(key) || 0)) {
+    pendingAcks.set(key, { timer: null, subject });
+    return;
+  }
+
+  const timer = setTimeout(async () => {
+    pendingAcks.delete(key);
+    busyReplyCooldown.set(key, Date.now() + PENDING_ACK_COOLDOWN_MS);
+    console.log(`busy-timer fired for chat ${key} (subject: "${subject.slice(0, 60)}")`);
+    try {
+      await ctx.reply(BUSY_REPLY_TEXT);
+    } catch (err) {
+      console.error("busy-timer reply failed:", err.message);
+    }
+  }, MAYOR_BUSY_TIMEOUT_MS);
+
+  pendingAcks.set(key, { timer, subject });
+}
+
+function cancelBusyTimer(chatId) {
+  const key = String(chatId);
+  const entry = pendingAcks.get(key);
+  if (!entry) return false;
+  if (entry.timer) clearTimeout(entry.timer);
+  pendingAcks.delete(key);
+  console.log(`heard arrived — cancelling busy-timer for chat ${key}`);
+  return true;
+}
+
 // --- Helpers ---
 
 async function gtMailSend(target, subject, body) {
@@ -437,6 +490,8 @@ bot.on("message:text", async (ctx) => {
     const nudgeText = rigScope
       ? `[Telegram from ${from} (${rigScope.join(",")} only)]: ${text}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply","chat":"${chatId}"}'`
       : `[Telegram from ${from}]: ${text}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply"}'`;
+
+    startBusyTimer(chatId, subject, ctx);
     try {
       await execFileAsync("gt", [
         "nudge", "mayor", nudgeText,
@@ -446,21 +501,12 @@ bot.on("message:text", async (ctx) => {
       console.error("Nudge failed (non-fatal):", nudgeErr.message);
     }
 
-    // If nudge failed, mayor is likely busy — auto-reply and start watching
+    // Nudge failure implies mayor is busy — keep the availability-watch machinery
+    // alive so we can announce "Mayor is back" later. The busy-timer started
+    // above handles the user-facing reply.
     if (!nudgeOk && !mayorBusy) {
       mayorBusy = true;
-      try {
-        await ctx.reply("Mayor is currently working and can't respond right now. Your message has been delivered — they'll see it shortly.");
-      } catch (replyErr) {
-        console.error("Failed to send busy auto-reply:", replyErr.message);
-      }
       startMayorWatch();
-    } else if (!nudgeOk && mayorBusy) {
-      try {
-        await ctx.reply("Message delivered. Mayor is still busy — will notify you when they're available.");
-      } catch (replyErr) {
-        console.error("Failed to send busy follow-up:", replyErr.message);
-      }
     }
 
     console.log(`Forwarded to mayor: "${subject}" (nudge: ${nudgeOk ? "ok" : "failed/busy"})`);
@@ -563,17 +609,13 @@ bot.on(["message:voice", "message:audio"], async (ctx) => {
     const nudgeText = rigScope
       ? `[Telegram voice from ${from} (${rigScope.join(",")} only)]: ${transcription}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply","chat":"${chatId}"}'`
       : `[Telegram voice from ${from}]: ${transcription}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply"}'`;
+    startBusyTimer(chatId, subject, ctx);
     try {
       await execFileAsync("gt", ["nudge", "mayor", nudgeText], { timeout: 70000 });
     } catch (nudgeErr) {
       console.error("Voice nudge failed (non-fatal):", nudgeErr.message);
       if (!mayorBusy) {
         mayorBusy = true;
-        try {
-          await ctx.reply("Mayor is currently working. Your voice message has been delivered — they'll see it shortly.");
-        } catch (replyErr) {
-          console.error("Failed to send busy auto-reply:", replyErr.message);
-        }
         startMayorWatch();
       }
     }
@@ -656,6 +698,7 @@ bot.on(["message:document", "message:photo", "message:video", "message:animation
 
       // Nudge
       const nudgeText = `[Telegram file from ${from}]: ${fileName} saved to ${destPath}${caption ? ` — "${caption}"` : ""}\n\nReply via: curl -s -X POST http://localhost:${CROW_PORT}/send -H 'Content-Type: application/json' -d '{"message":"your reply","chat":"${chatId}"}'`;
+      startBusyTimer(chatId, subject, ctx);
       try {
         await execFileAsync("gt", ["nudge", "mayor", nudgeText], { timeout: 70000 });
       } catch (nudgeErr) {
@@ -854,6 +897,8 @@ const httpServer = http.createServer(async (req, res) => {
           return;
         }
         const targetChat = chat ? String(chat) : ADMIN_CHAT_ID;
+        // Mayor saw it before our fast-reply timer fired — cancel the timer.
+        cancelBusyTimer(targetChat);
         const text = `heard: ${subject}`;
         try {
           await bot.api.sendMessage(targetChat, text);
