@@ -269,6 +269,7 @@ bot.command("help", async (ctx) => {
     "",
     `HTTP endpoints (localhost:${CROW_PORT}, for mayor):`,
     "  POST /send      — send text to Telegram",
+    "  POST /heard     — send short 'heard: <subject>' ack to Telegram",
     "  POST /sendfile  — send file to Telegram",
     "  POST /handoff   — trigger soft mayor handoff",
     "  POST /kill      — hard mayor restart",
@@ -837,6 +838,36 @@ const httpServer = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: true, delivered: results }));
       } catch (err) {
         console.error("HTTP /send error:", err.message);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+  } else if (req.method === "POST" && req.url === "/heard") {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", async () => {
+      try {
+        const { chat, subject } = JSON.parse(body);
+        if (!subject) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "subject field required" }));
+          return;
+        }
+        const targetChat = chat ? String(chat) : ADMIN_CHAT_ID;
+        const text = `heard: ${subject}`;
+        try {
+          await bot.api.sendMessage(targetChat, text);
+        } catch (sendErr) {
+          console.error(`HTTP /heard sendMessage failed for ${targetChat}:`, sendErr.message);
+          res.writeHead(502, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: sendErr.message }));
+          return;
+        }
+        console.log(`HTTP /heard: "${subject.slice(0, 60)}" -> ${targetChat}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, chat: targetChat }));
+      } catch (err) {
+        console.error("HTTP /heard error:", err.message);
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
