@@ -144,8 +144,20 @@ const TELEGRAM_SUBJECT_PREFIX = "Telegram from ";
 
 // --- Mayor busy-status tracking ---
 const MAYOR_CHECK_INTERVAL = parseInt(process.env.MAYOR_CHECK_INTERVAL_MS || "15000", 10);
+// If the availability probe subprocess returns in less than this, we assume
+// `gt nudge --mode=wait-idle` delivered directly (mayor was idle). A longer
+// return implies the probe was queued via gt's fallback — meaning the probe
+// content is still pending delivery and another probe would stack on top.
+const MAYOR_PROBE_FAST_RETURN_MS = 2000;
+// Grace period before re-probing after a probe was queued (slow-return or
+// timeout). Prevents a storm of queued probes piling up while mayor is busy
+// and flushing to mayor's context when mayor goes idle. See cr-zlg.
+const MAYOR_PROBE_QUEUE_GRACE_MS = 90_000;
+// Probe content — if it does reach mayor (queued), it's self-identifying.
+const MAYOR_PROBE_MSG = "[crow] availability probe — safe to ignore";
 let mayorBusy = false;
 let mayorCheckTimer = null;
+let mayorProbeQueuedAt = 0; // timestamp of last probe that was queued (0 = none pending)
 
 // --- Helpers ---
 
@@ -324,15 +336,33 @@ bot.command("sigint", async (ctx) => {
 
 async function checkMayorAvailable() {
   if (!GT_AVAILABLE) return false;
+
+  // Dedupe: if a probe was queued recently, skip this interval. `gt nudge
+  // --mode=wait-idle` falls back to queue on timeout, so without this guard
+  // every poll cycle stacks another queued probe — when mayor eventually goes
+  // idle, the whole pile flushes at once as visible nudges (cr-zlg).
+  if (mayorProbeQueuedAt > 0 && Date.now() - mayorProbeQueuedAt < MAYOR_PROBE_QUEUE_GRACE_MS) {
+    return false;
+  }
+
+  const start = Date.now();
   try {
-    // Use wait-idle nudge with a short timeout to probe availability
-    // A silent probe — the mayor sees nothing if idle
     await execFileAsync("gt", [
       "nudge", "mayor", "--mode", "wait-idle",
-      "ping",
+      MAYOR_PROBE_MSG,
     ], { timeout: 8000 });
-    return true;
+    const elapsed = Date.now() - start;
+    if (elapsed < MAYOR_PROBE_FAST_RETURN_MS) {
+      // Fast success = direct delivery to an idle mayor.
+      mayorProbeQueuedAt = 0;
+      return true;
+    }
+    // Slow success = gt fell back to queue; probe is still pending delivery.
+    mayorProbeQueuedAt = Date.now();
+    return false;
   } catch {
+    // Node-side timeout (subprocess killed). Probe was likely queued by gt.
+    mayorProbeQueuedAt = Date.now();
     return false;
   }
 }
@@ -357,6 +387,7 @@ async function startMayorWatch() {
     const available = await checkMayorAvailable();
     if (available && mayorBusy) {
       mayorBusy = false;
+      mayorProbeQueuedAt = 0;
       clearInterval(mayorCheckTimer);
       mayorCheckTimer = null;
       try {
